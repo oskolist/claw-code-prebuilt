@@ -1,0 +1,297 @@
+name: Build & Publish Upstream Rust Binary
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      tmate_enabled:
+        description: 'whether to run tmate when an error occured'
+        default: false
+        type: boolean
+      tmate_timeout:
+        description: 'tmate timout in minutes'
+        required: true
+        default: "5"
+        type: string
+
+env:
+  UPSTREAM_REPO: "ultraworkers/claw-code"
+  BINARY_NAME: "claw"
+  MAX_RELEASES: 3
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # ──────────────────────────────────────────────
+      # 1. Check if a release for the latest upstream
+      #    commit already exists — skip if it does
+      # ──────────────────────────────────────────────
+      - name: Get latest upstream commit info
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Fetch latest commit SHA and date from the upstream repo
+          COMMIT_JSON=$(gh api repos/${{ env.UPSTREAM_REPO }}/commits/HEAD)
+
+          COMMIT_SHA=$(echo "$COMMIT_JSON" | jq -r '.sha')
+          COMMIT_SHORT=$(echo "$COMMIT_SHA" | cut -c1-7)
+          COMMIT_DATE=$(echo "$COMMIT_JSON" | jq -r '.commit.committer.date' | cut -c1-10)
+
+          echo "sha=$COMMIT_SHA"         >> "$GITHUB_OUTPUT"
+          echo "short=$COMMIT_SHORT"     >> "$GITHUB_OUTPUT"
+          echo "date=$COMMIT_DATE"       >> "$GITHUB_OUTPUT"
+
+          TAG="upstream-${COMMIT_SHORT}-${COMMIT_DATE}"
+          echo "tag=$TAG"               >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+
+          # Try to fetch the release by tag; exit 0 if found, 1 if not
+          if gh release view "$TAG" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            echo "Release '$TAG' already exists. Nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No release found for '$TAG'. Proceeding with build."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ──────────────────────────────────────────────
+      # Everything below is skipped when the release
+      # already exists.
+      # ──────────────────────────────────────────────
+
+      - name: Checkout upstream repo
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.upstream.outputs.sha }}
+          fetch-depth: 1
+
+      # ──────────────────────────────────────────────
+      # 2. Set up Rust + cross-compilation toolchain
+      # ──────────────────────────────────────────────
+
+      - name: Set up Rust stable toolchain
+        if: steps.check.outputs.skip == 'false'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            x86_64-unknown-linux-gnu
+            aarch64-unknown-linux-gnu
+            x86_64-apple-darwin
+            aarch64-apple-darwin
+            x86_64-pc-windows-gnu
+            aarch64-pc-windows-gnullvm
+
+      - name: Install system dependencies
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc \
+            gcc-aarch64-linux-gnu \
+            gcc-mingw-w64-x86-64 \
+            llvm \
+            clang \
+            lld \
+            curl \
+            jq
+
+      #- name: Install cross
+      #  if: steps.check.outputs.skip == 'false'
+      #  run: |
+      #    cargo install cross --git https://github.com/cross-rs/cross
+      #- name: Cache cargo registry
+      #  if: steps.check.outputs.skip == 'false'
+      #  uses: actions/cache@v4
+      #  with:
+      #    path: |
+      #      ~/.cargo/registry
+      #      ~/.cargo/git
+      #      target
+      #    key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      #    restore-keys: |
+      #      ${{ runner.os }}-cargo-
+
+      # ──────────────────────────────────────────────
+      # 3. Build all targets using cross / cargo
+      # ──────────────────────────────────────────────
+
+      - name: Build — aarch64-unknown-linux-musl
+        if: steps.check.outputs.skip == 'false'
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: "aarch64-unknown-linux-musl"
+          args: "--release"
+          strip: true
+          working-directory: "${{ github.workspace }}/rust"
+      - name: Copy binary to dist - aarch64-unknown-linux-musl
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          mkdir -p dist
+          cp rust/target/aarch64-unknown-linux-musl/release/${{ env.BINARY_NAME }} \
+             dist/${{ env.BINARY_NAME }}-aarch64-unknown-linux-musl
+      - name: Build — x86_64-unknown-linux-gnu
+        if: steps.check.outputs.skip == 'false'
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: "x86_64-unknown-linux-gnu"
+          args: "--release"
+          strip: true
+          working-directory: "${{ github.workspace }}/rust"
+      - name: Copy binary to dist - x86_64-unknown-linux-gnu
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          mkdir -p dist
+          cp rust/target/x86_64-unknown-linux-gnu/release/${{ env.BINARY_NAME }} \
+             dist/${{ env.BINARY_NAME }}-x86_64-unknown-linux-gnu
+      #- name: Build — x86_64-unknown-linux-gnu
+      #  if: steps.check.outputs.skip == 'false'
+      #  run: |
+      #    cross build --release --target x86_64-unknown-linux-gnu
+      #    mkdir -p dist
+      #    cp target/x86_64-unknown-linux-gnu/release/${{ env.BINARY_NAME }} \
+      #       dist/${{ env.BINARY_NAME }}-x86_64-unknown-linux-gnu
+      #- name: Build — aarch64-unknown-linux-gnu
+      #  if: steps.check.outputs.skip == 'false'
+      #  run: |
+      #    cross build --release --target aarch64-unknown-linux-gnu
+      #    cp target/aarch64-unknown-linux-gnu/release/${{ env.BINARY_NAME }} \
+      #       dist/${{ env.BINARY_NAME }}-aarch64-unknown-linux-gnu
+      #- name: Build — x86_64-pc-windows-gnu
+      #  if: steps.check.outputs.skip == 'false'
+      #  run: |
+      #    cross build --release --target x86_64-pc-windows-gnu
+      #    cp target/x86_64-pc-windows-gnu/release/${{ env.BINARY_NAME }}.exe \
+      #       dist/${{ env.BINARY_NAME }}-x86_64-pc-windows-gnu.exe
+      #- name: Build — aarch64-pc-windows-gnullvm
+      #  if: steps.check.outputs.skip == 'false'
+      #  run: |
+      #    # cross uses the gnullvm variant for aarch64 Windows
+      #    cross build --release --target aarch64-pc-windows-gnullvm
+      #    cp target/aarch64-pc-windows-gnullvm/release/${{ env.BINARY_NAME }}.exe \
+      #       dist/${{ env.BINARY_NAME }}-aarch64-pc-windows-gnullvm.exe
+      #- name: Build — x86_64-apple-darwin
+      #  if: steps.check.outputs.skip == 'false'
+      #  run: |
+      #    # osxcross must be available; cross handles this via Docker image
+      #    cross build --release --target x86_64-apple-darwin
+      #    cp target/x86_64-apple-darwin/release/${{ env.BINARY_NAME }} \
+      #       dist/${{ env.BINARY_NAME }}-x86_64-apple-darwin
+      #- name: Build — aarch64-apple-darwin
+      #  if: steps.check.outputs.skip == 'false'
+      #  run: |
+      #    cross build --release --target aarch64-apple-darwin
+      #    cp target/aarch64-apple-darwin/release/${{ env.BINARY_NAME }} \
+      #       dist/${{ env.BINARY_NAME }}-aarch64-apple-darwin
+      #- name: Build — aarch64-linux-android
+      #  if: steps.check.outputs.skip == 'false'
+      #  run: |
+      #    # cross ships with Android NDK support out of the box
+      #    cross build --release --target aarch64-linux-android
+      #    cp target/aarch64-linux-android/release/${{ env.BINARY_NAME }} \
+      #       dist/${{ env.BINARY_NAME }}-aarch64-linux-android
+      #- name: Strip + compress all binaries
+      #  if: steps.check.outputs.skip == 'false'
+      #  run: |
+      #    cd dist
+      #    # Strip Linux / macOS / Android ELFs where possible (best-effort)
+      #    for f in \
+      #      ${{ env.BINARY_NAME }}-x86_64-unknown-linux-gnu \
+      #      ${{ env.BINARY_NAME }}-aarch64-linux-android; do
+      #      strip "$f" 2>/dev/null || true
+      #    done
+      #    # Compress everything
+      #    for f in *; do
+      #      case "$f" in
+      #        *.exe) zip "${f%.exe}.zip" "$f" && rm "$f" ;;
+      #        *)     tar czf "${f}.tar.gz" "$f" && rm "$f" ;;
+      #      esac
+      #    done
+      #    ls -lh
+
+      # ──────────────────────────────────────────────
+      # 4. Rotate old releases (keep only MAX_RELEASES)
+      # ──────────────────────────────────────────────
+
+      - name: Rotate old releases
+        if: steps.check.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MAX=${{ env.MAX_RELEASES }}
+
+          # List all releases sorted by creation date (newest first),
+          # skip the first MAX, delete the rest
+          RELEASE_TAGS=$(gh release list \
+            --repo "${{ github.repository }}" \
+            --limit 100 \
+            --json tagName,createdAt \
+            | jq -r 'sort_by(.createdAt) | reverse | .['"$MAX"':] | .[].tagName')
+
+          if [ -z "$RELEASE_TAGS" ]; then
+            echo "No old releases to remove."
+          else
+            echo "Removing old releases:"
+            echo "$RELEASE_TAGS"
+            for tag in $RELEASE_TAGS; do
+              gh release delete "$tag" \
+                --repo "${{ github.repository }}" \
+                --yes \
+                --cleanup-tag
+              echo "  Deleted release: $tag"
+            done
+          fi
+
+      # ──────────────────────────────────────────────
+      # 5. Publish new GitHub Release
+      # ──────────────────────────────────────────────
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          SHORT="${{ steps.upstream.outputs.short }}"
+          DATE="${{ steps.upstream.outputs.date }}"
+          UPSTREAM="${{ env.UPSTREAM_REPO }}"
+
+          TITLE="Build ${SHORT} — ${DATE}"
+
+          NOTES=$(cat <<EOF
+          ## Automated build from [\`${UPSTREAM}\`](https://github.com/${UPSTREAM})
+
+          | Field  | Value |
+          |--------|-------|
+          | Commit | [\`${SHORT}\`](https://github.com/${UPSTREAM}/commit/${{ steps.upstream.outputs.sha }}) |
+          | Date   | ${DATE} |
+
+          > Built automatically by [this workflow](https://github.com/${{ github.repository }}/actions).
+          EOF
+          )
+
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "$TITLE" \
+            --notes "$NOTES" \
+            dist/*
+
+      - name: Setup tmate session
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.tmate_enabled && failure() }}
+        uses: mxschmitt/action-tmate@v3
+        timeout-minutes: ${{ inputs.tmate_timeout }}
